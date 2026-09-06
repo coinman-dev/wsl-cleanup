@@ -15,7 +15,9 @@
 #   */secrets/**                        release keystores and build config
 #   ~/ownlocator-backups                your backups
 #   ~/.claude ~/.codex ~/.gemini        ALL AI AGENT SESSIONS, MEMORY, TRANSCRIPTS
-#   ~/.local/share/opencode             OpenCode memory and state
+#   ~/.copilot                           GitHub Copilot sessions, context, memory, logs
+#   ~/.cache/copilot                     GitHub Copilot cache and local state
+#   ~/.local/share/opencode              OpenCode memory and state
 #   any source tree, .git, .env         working source code and repo history
 #   local.properties, *.json            configuration and credentials
 #   documentation                       offline docs, project docs, markdown
@@ -468,6 +470,8 @@ note "ALL agent sessions, history and persistent memory are strictly preserved:"
 note "  ~/.claude (projects, sessions, tasks, memory)"
 note "  ~/.codex (sessions, memories, archived_sessions, rules, logs_2.sqlite)"
 note "  ~/.gemini (conversations, brain, cli)"
+note "  ~/.copilot (sessions, transcripts, context, memory, logs, configuration)"
+note "  ~/.cache/copilot (cache and local state)"
 note "  ~/.local/share/opencode"
 
 # ── 6. Local Postgres test cluster (--purge-pgtest) ──────────────────────────

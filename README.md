@@ -34,6 +34,8 @@ A safe, idempotent, and version-aware disk reclaim utility designed specifically
     - Codex (`~/.codex/sessions`, `~/.codex/memories`, `~/.codex/rules`, `~/.codex/logs_2.sqlite`)
     - Gemini / Antigravity (`~/.gemini/antigravity-acp/conversations`, `~/.gemini/antigravity-acp/brain`, CLI sessions)
     - OpenCode (`~/.local/share/opencode`)
+    - GitHub Copilot CLI (`~/.copilot`: sessions, transcripts, context, memory, logs, and configuration)
+    - GitHub Copilot cache (`~/.cache/copilot`) is also left untouched.
   - Only purges transient build/plugin scratch caches (`.tmp`, plugin caches) where no conversation history exists.
 - 📚 **Source Code & Documentation Safe**:
   - Source trees in `~/Development`, Git repositories (`.git`), commit history, and branches are never touched.
@@ -157,7 +159,7 @@ DEV_DIR=/path/to/my/projects ./wsl-cleanup.sh --force
 
 | Category | Cleaned / Reclaimed | Kept / Protected |
 | :--- | :--- | :--- |
-| **AI Agents** | Transient scratch files (`.tmp`, plugin cache) | **All** chat sessions, conversation history, memory, rules, tasks (`~/.claude`, `~/.codex`, `~/.gemini`, `opencode`) |
+| **AI Agents** | Transient scratch files (`.tmp`, plugin cache) | **All** chat sessions, conversation history, memory, rules, tasks (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.copilot`, `~/.local/share/opencode`) |
 | **Cursor & Editors** | Old extension versions, cached VSIX archives, superseded server binaries | Latest extension versions, active server binaries, settings |
 | **Go** | Older toolchain versions (`toolchain@...`) | **Latest** Go toolchain |
 | **Node / NPM** | `~/.npm/_npx`, `_cacache`, redundant musl/win32 global stubs | Active NVM version, pinned `.nvmrc` versions |
