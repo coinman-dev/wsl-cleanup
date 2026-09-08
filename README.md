@@ -1,3 +1,5 @@
+[English](/README.md) | [Русский](/README.ru_RU.md)
+
 # WSL Cleanup (`wsl-cleanup.sh`)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
