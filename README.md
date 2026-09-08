@@ -35,8 +35,13 @@ A safe, idempotent, and version-aware disk reclaim utility designed specifically
     - Gemini / Antigravity (`~/.gemini/antigravity-acp/conversations`, `~/.gemini/antigravity-acp/brain`, CLI sessions)
     - OpenCode (`~/.local/share/opencode`)
     - GitHub Copilot CLI (`~/.copilot`: sessions, transcripts, context, memory, logs, and configuration)
-    - GitHub Copilot cache (`~/.cache/copilot`) is also left untouched.
   - Only purges transient build/plugin scratch caches (`.tmp`, plugin caches) where no conversation history exists.
+  - `~/.cache/copilot` is **not** agent state and *is* cleaned: the Copilot CLI ships as a single
+    self-extracting binary and unpacks a ~140&nbsp;MB payload there on first launch, next to two JSON
+    files whose own first line reads *"Disposable cache … safe to delete"* and a folder of cached MCP
+    tool schemas. The next launch re-extracts it from the installed binary in ~2&nbsp;s, offline — so it
+    is reclaimed in the **default** run, not behind `--deep`. A version directory still marked
+    `inuse.<pid>.lock` by a live process is kept until that process exits.
 - 📚 **Source Code & Documentation Safe**:
   - Source trees in `~/Development`, Git repositories (`.git`), commit history, and branches are never touched.
   - Documentation files (`docs/`, `*.md`, offline Rust documentation) are strictly preserved.
@@ -159,7 +164,7 @@ DEV_DIR=/path/to/my/projects ./wsl-cleanup.sh --force
 
 | Category | Cleaned / Reclaimed | Kept / Protected |
 | :--- | :--- | :--- |
-| **AI Agents** | Transient scratch files (`.tmp`, plugin cache) | **All** chat sessions, conversation history, memory, rules, tasks (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.copilot`, `~/.local/share/opencode`) |
+| **AI Agents** | Transient scratch files (`.tmp`, plugin cache), the Copilot CLI's self-extracted payload (`~/.cache/copilot`, ~140 MB, rebuilt offline in ~2 s) | **All** chat sessions, conversation history, memory, rules, tasks (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.copilot`, `~/.local/share/opencode`) |
 | **Cursor & Editors** | Old extension versions, cached VSIX archives, superseded server binaries | Latest extension versions, active server binaries, settings |
 | **Go** | Older toolchain versions (`toolchain@...`) | **Latest** Go toolchain |
 | **Node / NPM** | `~/.npm/_npx`, `_cacache`, redundant musl/win32 global stubs | Active NVM version, pinned `.nvmrc` versions |

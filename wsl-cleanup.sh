@@ -16,7 +16,7 @@
 #   ~/ownlocator-backups                your backups
 #   ~/.claude ~/.codex ~/.gemini        ALL AI AGENT SESSIONS, MEMORY, TRANSCRIPTS
 #   ~/.copilot                           GitHub Copilot sessions, context, memory, logs
-#   ~/.cache/copilot                     GitHub Copilot cache and local state
+#                                        (~/.cache/copilot is NOT this: see below)
 #   ~/.local/share/opencode              OpenCode memory and state
 #   any source tree, .git, .env         working source code and repo history
 #   local.properties, *.json            configuration and credentials
@@ -40,10 +40,11 @@
 #   ./wsl-cleanup.sh --help
 #
 # The default run removes only data that rebuilds itself locally: editor and
-# compiler caches, build output under ~/Development, and every superseded
-# version of a toolchain or extension that keeps more than one (Go toolchains,
-# Cursor extensions, Gradle distributions, Node versions, Android build-tools,
-# agent releases). Only the newest working version is preserved.
+# compiler caches, build output under ~/Development, the ~140M payload the
+# Copilot CLI self-extracts into ~/.cache/copilot, and every superseded version
+# of a toolchain or extension that keeps more than one (Go toolchains, Cursor
+# extensions, Gradle distributions, Node versions, Android build-tools, agent
+# releases). Only the newest working version is preserved.
 #
 # Opt-in, because each of these costs a re-download rather than a rebuild
 # (--all turns them all on except --purge-pgtest, which is data, not cache):
@@ -161,6 +162,55 @@ in_use() {
   local p="$1"
   ls -l /proc/*/exe /proc/*/cwd 2>/dev/null | grep -q -- "$p" && return 0
   return 1
+}
+
+# Is a copilot process still executing out of this unpacked version directory?
+# in_use() cannot see it: the process runs the installed binary, not anything
+# under the cache. The CLI marks the copy it unpacked with inuse.<pid>.lock
+# instead, and removes that on exit.
+copilot_pkg_live() {
+  local d="$1" lock pid
+  for lock in "$d"/inuse.*.lock; do
+    [[ -e "$lock" ]] || continue
+    pid="${lock##*/inuse.}"; pid="${pid%.lock}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# ~/.copilot — sessions, transcripts, memory, config — is never touched. This
+# is the other directory, and despite its size every byte of it is derived:
+# the CLI ships as one self-extracting binary and unpacks its ~140M payload
+# into pkg/<platform>/<version>/ the first time it runs, beside two JSON files
+# whose own first line reads "Disposable cache … safe to delete. Managed
+# automatically." and a folder of cached MCP tool schemas. The next launch
+# re-extracts it from the installed binary in about two seconds with no
+# network, which is why this is in the default run and not behind --deep.
+clean_copilot_cache() {
+  local h="$1" who="$2"
+  local cache="$h/.cache/copilot"
+  step "GitHub Copilot CLI cache ($who) — ~/.copilot itself is never touched"
+  if [[ ! -d "$cache" ]]; then note "none"; return 0; fi
+
+  local d live=0
+  local -a vers=() dead=()
+  mapfile -t vers < <(find "$cache/pkg" -mindepth 2 -maxdepth 2 -type d 2>/dev/null)
+  for d in "${vers[@]}"; do
+    if copilot_pkg_live "$d"; then keep "$d"; live=1; else dead+=("$d"); fi
+  done
+
+  # Pulling the payload out from under a live CLI would break that session —
+  # possibly the one running this script. If any copy is held, only the
+  # superseded ones go and the small files wait for the next run.
+  if (( live )); then
+    note "a copilot process is running out of it — leaving what it holds"
+    for d in "${dead[@]}"; do drop "$d"; done
+    (( ${#dead[@]} )) || note "nothing else to drop"
+  else
+    note "re-extracted from the installed binary on next launch: local, offline, ~2s"
+    drop "$cache"
+  fi
 }
 
 # Keep the newest child of $1 (by mtime), drop the rest. For directories whose
@@ -307,6 +357,8 @@ clean_home_caches() {
   drop "$h/.gradle/caches/build-cache-1"
   drop "$h/.gradle/daemon"
   drop "$h/.gradle/kotlin-profile"
+
+  clean_copilot_cache "$h" "$who"
 
   # Package caches and heavy dependencies. Waiting for --deep because they re-download.
   [[ "$DEEP" -eq 1 ]] || return 0
@@ -471,8 +523,9 @@ note "  ~/.claude (projects, sessions, tasks, memory)"
 note "  ~/.codex (sessions, memories, archived_sessions, rules, logs_2.sqlite)"
 note "  ~/.gemini (conversations, brain, cli)"
 note "  ~/.copilot (sessions, transcripts, context, memory, logs, configuration)"
-note "  ~/.cache/copilot (cache and local state)"
 note "  ~/.local/share/opencode"
+note "~/.cache/copilot is not in this list: it holds no session or memory data, only"
+note "  the payload the CLI unpacks out of its own binary. Cleaned above."
 
 # ── 6. Local Postgres test cluster (--purge-pgtest) ──────────────────────────
 step "Local Postgres test cluster (--purge-pgtest)"
