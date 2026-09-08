@@ -18,6 +18,8 @@
 #   ~/.copilot                           GitHub Copilot sessions, context, memory, logs
 #                                        (~/.cache/copilot is NOT this: see below)
 #   ~/.local/share/opencode              OpenCode memory and state
+#   ~/.cache/google-vscode-extension    live Google OAuth + ADC refresh tokens
+#   deviceid, telemetry.uuid            machine identity filed under ~/.cache
 #   any source tree, .git, .env         working source code and repo history
 #   local.properties, *.json            configuration and credentials
 #   documentation                       offline docs, project docs, markdown
@@ -134,12 +136,16 @@ TOTAL=0   # bytes of everything this run dropped (or would drop)
 # The one place anything is deleted. Prints the path with its size, adds it to
 # the running total, and removes it only under --force. chmod first: Go's
 # module cache is deliberately read-only, and rm -rf alone bounces off it.
+# DROP_QUIET suppresses the per-path line without touching the accounting, for
+# the one caller that removes hundreds of entries at once and reports a total.
+DROP_QUIET=0
+
 drop() {
   local p="$1" b
   [[ -e "$p" ]] || return 0
   b="$(size_of "$p")"
   TOTAL=$(( TOTAL + b ))
-  printf '   %s%8s%s  %s\n' "$c_ylw" "$(human "$b")" "$c_rst" "${p/#$HOME/\~}"
+  (( DROP_QUIET )) || printf '   %s%8s%s  %s\n' "$c_ylw" "$(human "$b")" "$c_rst" "${p/#$HOME/\~}"
   if [[ "$FORCE" -eq 1 ]]; then
     chmod -R u+w "$p" 2>/dev/null || true
     rm -rf -- "$p" 2>/dev/null || sudo rm -rf -- "$p" 2>/dev/null || true
@@ -211,6 +217,129 @@ clean_copilot_cache() {
     note "re-extracted from the installed binary on next launch: local, offline, ~2s"
     drop "$cache"
   fi
+}
+
+# Zed opens a crash-handler socket per instance under ~/.cache/zed and never
+# reaps it, so one accumulates per editor launch — a few hundred over a few
+# months. They are zero-byte unix sockets: what they cost is directory entries
+# and the impression that ~/.cache is a junk drawer, not disk. A socket whose
+# pid is still alive belongs to a running editor and stays; the pid is the
+# trailing field of the name, the same trick copilot_pkg_live() plays.
+clean_zed_sockets() {
+  local h="$1" who="$2"
+  local d="$h/.cache/zed"
+  step "Zed crash-handler sockets ($who)"
+  if [[ ! -d "$d" ]]; then note "none"; return 0; fi
+
+  local sock pid live=0
+  local -a dead=()
+  for sock in "$d"/*crash-handler-*; do
+    [[ -S "$sock" ]] || continue
+    pid="${sock##*-}"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      live=$(( live + 1 ))
+    else
+      dead+=("$sock")
+    fi
+  done
+
+  if (( ${#dead[@]} == 0 )); then
+    note "none stale${live:+ ($live held by running editors)}"
+    return 0
+  fi
+
+  DROP_QUIET=1
+  for sock in "${dead[@]}"; do drop "$sock"; done
+  DROP_QUIET=0
+  note "${#dead[@]} stale sockets from exited editors ($live still running, kept)"
+}
+
+# What this machine can actually execute, in the tokens npm and prebuildify use
+# for their directory names.
+HOST_OS="$(uname -s | tr "[:upper:]" "[:lower:]")"
+case "$HOST_OS" in darwin) HOST_OS=darwin ;; linux) HOST_OS=linux ;; esac
+case "$(uname -m)" in
+  x86_64|amd64) HOST_ARCH=x64 ;;
+  aarch64|arm64) HOST_ARCH=arm64 ;;
+  *) HOST_ARCH="$(uname -m)" ;;
+esac
+HOST_LIBC=glibc
+ldd --version 2>&1 | head -1 | grep -qi musl && HOST_LIBC=musl
+
+# A Windows PE, a Mach-O or an arm64 ELF cannot execute on this machine under
+# any circumstances. Untagged names return false: silence is not an invitation.
+foreign_os_or_arch() {
+  local name="$1" os="" arch=""
+  case "$name" in
+    *darwin*|*macos*)          os=darwin ;;
+    *win32*|*win10*|*windows*) os=win32 ;;
+    *freebsd*)                 os=freebsd ;;
+    *android*)                 os=android ;;
+    *linuxmusl*|*linux*)       os=linux ;;
+  esac
+  case "$name" in
+    *arm64*|*aarch64*)  arch=arm64 ;;
+    *x64*|*x86_64*)     arch=x64 ;;
+    *ia32*)             arch=ia32 ;;
+  esac
+  [[ -n "$os"   && "$os"   != "$HOST_OS"   ]] && return 0
+  [[ -n "$arch" && "$arch" != "$HOST_ARCH" ]] && return 0
+  return 1
+}
+
+# musl is not a foreign platform by itself. A statically linked musl binary runs
+# perfectly well on glibc, and that is how Codex ships: vendor/ holds only
+# x86_64-unknown-linux-musl and codex.js resolves exactly that path, so reading
+# the token as "cannot run here" would delete the working program. A musl build
+# is surplus only when the same package offers this machine's libc right beside
+# it — Copilot does, and its loader reaches for the musl one solely when
+# detect-libc reports a non-glibc Linux.
+surplus_libc_build() {
+  local d="$1" base parent alt
+  [[ "$HOST_LIBC" == glibc ]] || return 1
+  base="$(basename "$d")"
+  case "$base" in *musl*) ;; *) return 1 ;; esac
+  parent="$(dirname "$d")"
+  for alt in "${base/linuxmusl/linux}" "${base%-musl}-gnu" "${base%-musl}"; do
+    [[ "$alt" != "$base" && -d "$parent/$alt" ]] && return 0
+  done
+  return 1
+}
+
+# npm publishes one package per platform and picks at load time, so an x86-64
+# Linux box ends up carrying binaries for macOS, Windows and arm that it cannot
+# run at all. Two hardcoded paths used to cover one package; this finds them
+# wherever they are installed.
+#
+# Two conventions are walked:
+#   anything under node_modules/<scope>/    npm optional platform deps
+#   anything under a prebuilds/ directory   prebuildify / node-gyp-build
+# A directory whose name carries no platform token is never considered, and a
+# musl build with no glibc sibling is left alone — see surplus_libc_build.
+prune_foreign_platform_binaries() {
+  local who="$1"; shift
+  step "Binaries for other platforms ($who) — this box is $HOST_OS/$HOST_ARCH/$HOST_LIBC"
+  # No -prune on the find: a scope directory matches the first pattern, and
+  # pruning there would stop the walk before reaching the prebuilds/ nested
+  # several node_modules deeper — which is where 58M of Windows node-pty hides.
+  # Descending everywhere instead means a match can sit inside another match, so
+  # sorted order plus a list of what was already taken keeps the accounting from
+  # counting the same bytes twice in a dry run.
+  local root d t skip found=0
+  local -a taken=()
+  for root in "$@"; do
+    [[ -d "$root" ]] || continue
+    while IFS= read -r d; do
+      foreign_os_or_arch "$(basename "$d")" || surplus_libc_build "$d" || continue
+      skip=0
+      for t in "${taken[@]}"; do [[ "$d" == "$t"/* ]] && { skip=1; break; }; done
+      (( skip )) && continue
+      taken+=("$d")
+      drop "$d"; found=1
+    done < <(find "$root" -maxdepth 10 -type d \
+               \( -path '*/node_modules/@*/*' -o -path '*/prebuilds/*' \) 2>/dev/null | sort)
+  done
+  (( found )) || note "none"
 }
 
 # Keep the newest child of $1 (by mtime), drop the rest. For directories whose
@@ -313,7 +442,14 @@ clean_home_caches() {
   step "Zed extension build scratch ($who)"
   drop "$h/.local/share/zed/remote_extensions/work"
   drop "$h/.local/share/zed/remote_extensions/uploads"
-  find "$h/.local/share/zed/logs" -type f -name '*.log.*' 2>/dev/null | while read -r f; do drop "$f"; done
+  # mapfile, not `find | while`: under `set -o pipefail` a find that exits 1 on a
+  # missing directory becomes the pipeline's status and `set -e` kills the run.
+  # root has no ~/.local/share/zed, which is how --system silently aborted here
+  # and never reached root's 1.6G below.
+  local f
+  local -a zlogs=()
+  mapfile -t zlogs < <(find "$h/.local/share/zed/logs" -type f -name '*.log.*' 2>/dev/null)
+  for f in "${zlogs[@]}"; do drop "$f"; done
 
   step "Editor servers and Node runtimes ($who) — keep the newest of each"
   local d
@@ -340,7 +476,7 @@ clean_home_caches() {
 
   # Compiler and developer caches. Rebuilds locally on demand.
   # AI agent memory and sessions are NEVER touched here — only transient scratch caches.
-  step "Compiler / tool caches ($who)"
+  step "Compiler, font and GPU caches ($who)"
   drop "$h/.cache/go-build"
   drop "$h/.cache/staticcheck"
   drop "$h/.cache/gopls"
@@ -350,6 +486,13 @@ clean_home_caches() {
   drop "$h/.cache/cloud-code"
   drop "$h/.cache/claude-cli-nodejs"
   drop "$h/.cache/opencode"
+  drop "$h/.cache/mesa_shader_cache"
+  drop "$h/.cache/fontconfig"
+  # Antigravity's agent server unpacks an embedded ripgrep here, named by
+  # content hash, and re-extracts it from the installed .par when it is gone.
+  drop "$h/.cache/jetski"
+  drop "$h/.cache/JNA/temp"
+  drop "$h/.cache/main.kts.compiled.cache"
   drop "$h/.config/JetBrains/analyzer/workspaces"
   drop "$h/.codex/.tmp"
   drop "$h/.codex/plugins/cache"
@@ -359,14 +502,32 @@ clean_home_caches() {
   drop "$h/.gradle/kotlin-profile"
 
   clean_copilot_cache "$h" "$who"
+  clean_zed_sockets "$h" "$who"
+  prune_foreign_platform_binaries "$who" \
+    "$h/.local/share/zed/external_agents" "$h/.local/share/zed/node"
+
+  # launchpadlib caches Launchpad's API responses for add-apt-repository. Only
+  # the cache subtree: the library also files OAuth credentials in this
+  # directory on machines that have logged in.
+  drop "$h/.launchpadlib/api.launchpad.net/cache"
 
   # Package caches and heavy dependencies. Waiting for --deep because they re-download.
   [[ "$DEEP" -eq 1 ]] || return 0
   step "Package caches ($who, --deep)"
   local m tr
+  local sub
   for m in "$h"/go/pkg/mod/*/; do
     m="${m%/}"
-    [[ "$(basename "$m")" == "golang.org" ]] && continue   # toolchains: handled above
+    # golang.org holds the downloaded toolchains, pruned above by version — but
+    # also golang.org/x, which is ordinary module cache and was being spared by
+    # association with them. Skip the toolchains by name, not the parent.
+    if [[ "$(basename "$m")" == "golang.org" ]]; then
+      for sub in "$m"/*; do
+        [[ "$(basename "$sub")" == toolchain@* ]] && continue
+        drop "$sub"
+      done
+      continue
+    fi
     drop "$m"
   done
   drop "$h/.npm/_npx"
@@ -562,7 +723,12 @@ if [[ "$SYSTEM" -eq 1 ]]; then
     if [[ "$FORCE" -eq 1 ]]; then
       $SUDO apt-get clean
       DEBIAN_FRONTEND=noninteractive $SUDO apt-get autoremove --purge -y
+      # journalctl reports what it freed on stderr in its own format; measuring
+      # the directory is both simpler and in the same units as everything else.
+      JOURNAL_B0="$($SUDO du -sB1 /var/log/journal 2>/dev/null | cut -f1)"
       $SUDO journalctl --vacuum-size="$JOURNAL_KEEP"
+      JOURNAL_B1="$($SUDO du -sB1 /var/log/journal 2>/dev/null | cut -f1)"
+      TOTAL=$(( TOTAL + ${JOURNAL_B0:-0} - ${JOURNAL_B1:-0} ))
     else
       note "[dry] apt-get clean"
       $SUDO apt-get -s autoremove --purge 2>/dev/null | grep -E '^Remv' | sed 's/^/   [dry] /' \
@@ -580,9 +746,13 @@ if [[ "$SYSTEM" -eq 1 ]]; then
     fi
 
     # The downloaded package index
+    # Hand-rolled rather than drop(): lock and partial have to survive inside the
+    # directory. That means the running total has to be fed here by hand too, or
+    # the summary under-reports the run by however big the index is.
     if [[ -d /var/lib/apt/lists ]]; then
-      printf '   %s%8s%s  %s\n' "$c_ylw" \
-        "$(human "$($SUDO du -sB1 /var/lib/apt/lists 2>/dev/null | cut -f1)")" "$c_rst" \
+      APT_LISTS_B="$($SUDO du -sB1 /var/lib/apt/lists 2>/dev/null | cut -f1)"
+      TOTAL=$(( TOTAL + ${APT_LISTS_B:-0} ))
+      printf '   %s%8s%s  %s\n' "$c_ylw" "$(human "${APT_LISTS_B:-0}")" "$c_rst" \
         "/var/lib/apt/lists"
       if [[ "$FORCE" -eq 1 ]]; then
         $SUDO find /var/lib/apt/lists -mindepth 1 -maxdepth 1 -not -name lock -not -name partial -delete
@@ -590,7 +760,7 @@ if [[ "$SYSTEM" -eq 1 ]]; then
     fi
 
     # Incompatible platform binaries downloaded by global npm
-    drop "/usr/local/lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64-musl"
+    prune_foreign_platform_binaries "global npm" /usr/local/lib/node_modules
     drop "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
   fi
 else
@@ -626,6 +796,24 @@ fi
 step "Left alone on purpose"
 note "AI agent sessions, memories and history are preserved."
 note "working source code and project documentation are preserved."
+
+# ~/.cache is disposable by specification, and applications ignore that. These
+# were found by looking rather than by assuming, and are deliberately absent
+# from every list above — the reason `rm -rf ~/.cache/*` is not what this
+# script does. Named here so the next reader knows the difference is intended.
+CACHE_STATE=(
+  "$HOME/.cache/google-vscode-extension/auth|live Google OAuth + ADC refresh tokens: deleting these logs you out"
+  "$HOME/.cache/Microsoft/DeveloperTools/deviceid|stable device id, regenerates but changes identity"
+  "$HOME/.cache/powershell/telemetry.uuid|stable telemetry id, same"
+)
+CACHE_STATE_SEEN=0
+for entry in "${CACHE_STATE[@]}"; do
+  [[ -e "${entry%%|*}" ]] || continue
+  (( CACHE_STATE_SEEN )) || note "under ~/.cache, state rather than cache, never removed:"
+  CACHE_STATE_SEEN=1
+  path="${entry%%|*}"
+  note "  ${path/#$HOME/\~}: ${entry#*|}"
+done
 if [[ "$(uname -r)" == *microsoft-standard-WSL2* ]]; then
   mapfile -t HDRS < <(dpkg-query -Wf '${Package}\n' 'linux-headers-*' 2>/dev/null | sed '/^$/d')
   if (( ${#HDRS[@]} > 0 )); then

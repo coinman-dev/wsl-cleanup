@@ -36,6 +36,8 @@ A safe, idempotent, and version-aware disk reclaim utility designed specifically
     - OpenCode (`~/.local/share/opencode`)
     - GitHub Copilot CLI (`~/.copilot`: sessions, transcripts, context, memory, logs, and configuration)
   - Only purges transient build/plugin scratch caches (`.tmp`, plugin caches) where no conversation history exists.
+  - Zed leaks one crash-handler socket per launch into `~/.cache/zed` and never reaps them;
+    stale ones are removed, sockets belonging to a running editor are kept.
   - `~/.cache/copilot` is **not** agent state and *is* cleaned: the Copilot CLI ships as a single
     self-extracting binary and unpacks a ~140&nbsp;MB payload there on first launch, next to two JSON
     files whose own first line reads *"Disposable cache … safe to delete"* and a folder of cached MCP
@@ -166,8 +168,9 @@ DEV_DIR=/path/to/my/projects ./wsl-cleanup.sh --force
 | :--- | :--- | :--- |
 | **AI Agents** | Transient scratch files (`.tmp`, plugin cache), the Copilot CLI's self-extracted payload (`~/.cache/copilot`, ~140 MB, rebuilt offline in ~2 s) | **All** chat sessions, conversation history, memory, rules, tasks (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.copilot`, `~/.local/share/opencode`) |
 | **Cursor & Editors** | Old extension versions, cached VSIX archives, superseded server binaries | Latest extension versions, active server binaries, settings |
-| **Go** | Older toolchain versions (`toolchain@...`) | **Latest** Go toolchain |
-| **Node / NPM** | `~/.npm/_npx`, `_cacache`, redundant musl/win32 global stubs | Active NVM version, pinned `.nvmrc` versions |
+| **Go** | Older toolchain versions (`toolchain@...`), and `golang.org/x` module cache under `--deep` | **Latest** Go toolchain |
+| **Node / NPM** | `~/.npm/_npx`, `_cacache` | Active NVM version, pinned `.nvmrc` versions |
+| **Other-platform binaries** | Packages tagged for an OS or architecture this machine cannot execute — `win32-*`, `darwin-*`, `*-arm64` — wherever npm or prebuildify installed them | Anything untagged, and a musl build with no glibc sibling (Codex ships **only** a static musl binary, which runs fine on glibc) |
 | **Rust / Cargo** | Redownloadable registry index/cache (under `--deep`), `target/` build output | Offline documentation (`rust-docs`), active toolchains |
 | **Android / Gradle** | Superseded build-tools, build cache, transforms (under `--deep`) | Active build-tools, wrapper distribution, keystores |
 | **Repositories** | Build artifacts (`target/`, `build/`, `dist/`, `.gradle/`, `reports/`) | All source code, Git history, documentation, `.env` configs |
