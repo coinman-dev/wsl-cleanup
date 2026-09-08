@@ -105,7 +105,56 @@ sudo ./wsl-cleanup.sh --force --all
 | `--purge-bak` | Purges rollback copies (`*.bak*`) in `/opt/ownlocator` and stale media backups in `/var/lib/ownlocator/media-wsl-backup`. |
 | `--purge-pgtest` | Purges the local PostgreSQL test cluster in `~/.local/pgtest` (if no postgres process is active). |
 | `--all` | Enables `--deep`, `--system`, and `--purge-bak` together. |
+| `--list-installed [word]` | Inventory of installed **programs**, largest first. Optional word filters it. |
+| `--uninstall <handle>` | Removes one entry from that inventory, using whatever installed it. Dry run unless `--force`. |
 | `-h`, `--help` | Displays help message and exits. |
+
+---
+
+## Installed Programs
+
+Cache sweeps never touch whole programs, and on a development box those are usually
+the larger half of a full disk. Two modes cover them.
+
+```bash
+./wsl-cleanup.sh --list-installed
+```
+
+```
+==> Installed programs — largest first
+      1.9GB  agent:antigravity-acp        1.1.1     zed external agent
+      818MB  sdk:emulator                 -         android sdk
+      456MB  nvm:v22.22.1                 v22.22.1  nvm
+      375MB  npm:@anthropic-ai/claude-code 2.1.245  /usr/local/lib/node_modules
+       44MB  apt:gh                       2.45.0    apt
+       16MB  go:staticcheck               -         go install
+       12MB  cargo:cargo-xwin             v0.21.4   cargo install
+```
+
+It reads apt, every global npm root, `cargo install`, `go install`, nvm, the Android
+SDK and Zed's agent registry. Each line begins with a `manager:name` **handle**, which
+is what makes the second mode unambiguous — `gopls` is plausibly a Go binary and a Zed
+language server at once.
+
+```bash
+./wsl-cleanup.sh --uninstall gh                    # dry run: shows the command
+./wsl-cleanup.sh --force --uninstall sdk:emulator  # actually removes it
+```
+
+Removal is handed to whoever installed the thing — apt purges, npm and cargo and
+`sdkmanager` uninstall, and a directory no installer owns goes through the same
+`drop()` as everything else the script deletes. A bare name works when only one
+manager has it; otherwise the script lists the candidates and stops.
+
+Three deliberate limits:
+
+- **apt lines are manually installed packages only.** A dependency nobody chose is not
+  a program somebody installed, and `--system` already autoremoves the orphans. Asking
+  to uninstall one says so rather than claiming it isn't there.
+- **Essential and required apt packages are refused.** apt will take half the system
+  with `libc6` if asked; the answer here is no.
+- **Dry run first, always.** For apt the preview includes the full cascade (`apt-get -s
+  purge`), so what a package drags out with it is visible before `--force`.
 
 ---
 

@@ -41,6 +41,20 @@
 #   ./wsl-cleanup.sh --force --all      # everything below as well
 #   ./wsl-cleanup.sh --help
 #
+# Installed programs are the other half of a full disk, and no cache sweep will
+# ever touch them. Two modes report on and remove them instead:
+#   --list-installed [word]   everything installed on this box, largest first,
+#                             from apt, global npm, cargo, go install, nvm, the
+#                             Android SDK and Zed's agent registry. Each line
+#                             starts with a <manager>:<name> handle.
+#   --uninstall <handle>      remove one, using whatever installed it: apt
+#                             purges, npm and cargo and sdkmanager uninstall,
+#                             and a directory nobody owns is simply dropped. A
+#                             bare name is fine when only one manager has it.
+#                             DRY RUN as well — it prints the exact command, and
+#                             for apt the full cascade, until you add --force.
+#                             Essential and required apt packages are refused.
+#
 # The default run removes only data that rebuilds itself locally: editor and
 # compiler caches, build output under ~/Development, the ~140M payload the
 # Copilot CLI self-extracts into ~/.cache/copilot, and every superseded version
@@ -94,8 +108,13 @@ DEEP=0
 SYSTEM=0
 PURGE_PGTEST=0
 PURGE_BAK=0
+LIST_INSTALLED=0
+LIST_FILTER=""
+UNINSTALL=""
 
-for arg in "$@"; do
+# --uninstall takes a value, which `for arg in "$@"` cannot consume.
+while (( $# )); do
+  arg="$1"
   case "$arg" in
     --force)            FORCE=1 ;;
     --deep)             DEEP=1 ;;
@@ -114,10 +133,21 @@ for arg in "$@"; do
       # that isn't a comment rather than at a line number that goes stale.
       awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
       exit 0 ;;
+    --list-installed)
+      LIST_INSTALLED=1
+      # An optional filter word may follow it — but not another flag.
+      if [[ -n "${2:-}" && "${2:-}" != -* ]]; then LIST_FILTER="$2"; shift; fi ;;
+    --list-installed=*) LIST_INSTALLED=1; LIST_FILTER="${arg#*=}" ;;
+    --uninstall)
+      UNINSTALL="${2:-}"
+      [[ -n "$UNINSTALL" ]] || { echo "--uninstall needs a name (try --list-installed)" >&2; exit 2; }
+      shift ;;
+    --uninstall=*)      UNINSTALL="${arg#*=}" ;;
     *)
       echo "unknown option: $arg (try --help)" >&2
       exit 2 ;;
   esac
+  shift
 done
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -546,6 +576,250 @@ clean_home_caches() {
   drop "$h/.gradle/.tmp"
 }
 
+# ── installed programs: inventory and removal ────────────────────────────────
+# Everything above removes derived data. This is the other half of a full disk:
+# whole programs somebody installed on purpose, which no cache sweep will ever
+# touch. The script has always ended by suggesting `apt-mark showmanual | ...`
+# and leaving the reader to it; these two modes do that properly, across every
+# installer this box actually uses, and let one entry be removed by the tool
+# that owns it rather than by rm.
+#
+# A handle is <manager>:<name>. The prefix disambiguates — gopls is plausibly a
+# Go binary and a Zed language server at once — and it selects the removal
+# command: apt purges, npm and cargo and sdkmanager uninstall, and the rest are
+# directories one owner unpacked and can simply lose.
+#
+# Both modes honour the dry run. `--uninstall X` prints the exact command and
+# the bytes it would return; only --force runs it.
+
+# Where a global npm install can land. `npm root -g` answers for whichever node
+# is first on PATH, which on this box is Zed's, not the system one.
+npm_global_roots() {
+  local r
+  for r in /usr/local/lib/node_modules /usr/lib/node_modules "$(npm root -g 2>/dev/null)"; do
+    [[ -n "$r" && -d "$r" ]] && echo "$r"
+  done | sort -u
+}
+
+# One line per installed program: bytes, handle, version, where it came from.
+# Sizes are real disk usage except for apt, which is asked rather than measured:
+# a package's files are scattered over the whole filesystem and dpkg is the only
+# thing that knows which ones are its.
+inventory() {
+  local d n v b root
+
+  if command -v dpkg-query >/dev/null 2>&1; then
+    declare -A manual=()
+    while read -r n; do [[ -n "$n" ]] && manual["$n"]=1; done < <(apt-mark showmanual 2>/dev/null)
+    while IFS=$'\t' read -r b n v; do
+      # Dependencies nobody chose are noise here, and autoremove already deals
+      # with the orphans among them.
+      [[ -n "${manual[$n]:-}" ]] || continue
+      printf '%s\tapt:%s\t%s\tapt\n' "$(( b * 1024 ))" "$n" "$v"
+    done < <(dpkg-query -Wf '${Installed-Size}\t${Package}\t${Version}\n' 2>/dev/null)
+  fi
+
+  while read -r root; do
+    for d in "$root"/*; do
+      [[ -d "$d" ]] || continue
+      n="$(basename "$d")"
+      # A scope directory is not a package; the packages are inside it.
+      if [[ "$n" == @* ]]; then
+        for d in "$d"/*; do
+          [[ -d "$d" ]] || continue
+          printf '%s\tnpm:%s/%s\t%s\t%s\n' "$(size_of "$d")" "$n" "$(basename "$d")" \
+            "$(npm_pkg_version "$d")" "$root"
+        done
+      else
+        printf '%s\tnpm:%s\t%s\t%s\n' "$(size_of "$d")" "$n" "$(npm_pkg_version "$d")" "$root"
+      fi
+    done
+  done < <(npm_global_roots)
+
+  # registry/npx is not an agent, it is a shelf of them — the same reason an npm
+  # scope directory gets opened rather than counted.
+  local sub
+  for d in "$HOME"/.local/share/zed/external_agents/registry/*; do
+    [[ -d "$d" ]] || continue
+    n="$(basename "$d")"
+    [[ "$n" == icons ]] && continue
+    if [[ "$n" == npx ]]; then
+      for sub in "$d"/*; do
+        [[ -d "$sub" ]] || continue
+        printf '%s\tagent:npx/%s\t%s\tzed agent (npx)\n' "$(size_of "$sub")" \
+          "$(basename "$sub")" "$(npm_pkg_version "$sub")"
+      done
+    else
+      printf '%s\tagent:%s\t%s\tzed external agent\n' "$(size_of "$d")" "$n" \
+        "$(agent_release_version "$d")"
+    fi
+  done
+
+  while read -r n v; do
+    [[ -n "$n" ]] || continue
+    printf '%s\tcargo:%s\t%s\tcargo install\n' "$(size_of "$HOME/.cargo/bin/$n")" "$n" "$v"
+  done < <(cargo install --list 2>/dev/null | sed -n 's/^\([^ ]*\) \(v[^:]*\):$/\1 \2/p')
+
+  for d in "$HOME"/go/bin/*; do
+    [[ -f "$d" ]] || continue
+    printf '%s\tgo:%s\t-\tgo install\n' "$(size_of "$d")" "$(basename "$d")"
+  done
+
+  for d in "$HOME"/.nvm/versions/node/*; do
+    [[ -d "$d" ]] || continue
+    printf '%s\tnvm:%s\t%s\tnvm\n' "$(size_of "$d")" "$(basename "$d")" "$(basename "$d")"
+  done
+
+  local sdk="${ANDROID_HOME:-$HOME/Android/Sdk}"
+  for d in "$sdk"/*; do
+    [[ -d "$d" ]] || continue
+    n="$(basename "$d")"
+    [[ "$n" == licenses ]] && continue
+    printf '%s\tsdk:%s\t-\tandroid sdk\n' "$(size_of "$d")" "$n"
+  done
+}
+
+# Zed names an agent release v_<version>_<hash>_<hash>. Only the version part
+# says anything to a reader.
+agent_release_version() {
+  local v
+  v="$(basename "$(ls -1dt "$1"/v_*/ 2>/dev/null | head -1)" 2>/dev/null \
+       | sed -n 's/^v_\([^_]*\)_.*/\1/p')"
+  echo "${v:--}"
+}
+
+# package.json is the only place an npm package states its own version, and a
+# missing or unreadable one is not worth failing over.
+npm_pkg_version() {
+  local v
+  v="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1/package.json" 2>/dev/null | head -1)"
+  echo "${v:--}"
+}
+
+# --list-installed [pattern]
+cmd_list_installed() {
+  local pattern="${1:-}" total=0 b h v src n=0
+  step "Installed programs${pattern:+ matching \"$pattern\"} — largest first"
+  while IFS=$'\t' read -r b h v src; do
+    [[ -n "$pattern" && "$h" != *"$pattern"* ]] && continue
+    total=$(( total + b )); n=$(( n + 1 ))
+    printf '   %s%8s%s  %-40s %-16s %s%s%s\n' \
+      "$c_ylw" "$(human "$b")" "$c_rst" "$h" "${v:--}" "$c_dim" "$src" "$c_rst"
+  done < <(inventory | sort -rn -t$'\t' -k1,1)
+
+  if (( n == 0 )); then note "nothing matched"; return 0; fi
+  note "$n program$( (( n == 1 )) || echo s ), $(human "$total") total — apt reports dpkg's figure, the rest are measured"
+  note "remove one with:  $0 --uninstall <handle>   (add --force to actually do it)"
+  note "apt lines are manually installed packages only — a dependency nobody chose is not"
+  note "  a program somebody installed, and --system already autoremoves the orphans among"
+  note "  them. --uninstall shows what a package drags out with it before it does anything."
+
+  # Real space, visible from here, owned by no installer: unpacking these was
+  # somebody's shell command and removing them has to be one too.
+  local d shown=0
+  for d in /opt/* /usr/local/lib /usr/local/x-ui; do
+    [[ -d "$d" ]] || continue
+    (( shown )) || note "no installer owns these — remove them by hand:"
+    shown=1
+    printf '   %s%8s  %s%s\n' "$c_dim" "$(human "$(size_of "$d")")" "$d" "$c_rst"
+  done
+}
+
+# --uninstall <handle>. Resolves a bare name against the inventory, refuses the
+# packages the system is built out of, and otherwise hands the job to whoever
+# installed the thing.
+cmd_uninstall() {
+  local want="$1" mgr name path b h v src
+  local -a matches=()
+
+  while IFS=$'\t' read -r b h v src; do
+    if [[ "$want" == *:* ]]; then [[ "$h" == "$want" ]] && matches+=("$b|$h|$src")
+    else                          [[ "${h#*:}" == "$want" ]] && matches+=("$b|$h|$src"); fi
+  done < <(inventory)
+
+  if (( ${#matches[@]} == 0 )); then
+    # dpkg knows about thousands of packages the inventory deliberately hides.
+    # Saying "not installed" about libc6 would simply be false.
+    if dpkg-query -W "${want#apt:}" >/dev/null 2>&1; then
+      echo "${want#apt:} is installed, but as a dependency rather than a choice — this" >&2
+      echo "script only offers to remove what someone installed on purpose. Remove" >&2
+      echo "whatever pulled it in, or let --force --system autoremove the orphans." >&2
+      return 1
+    fi
+    echo "not installed, or not something this script can see: $want" >&2
+    echo "look for it with:  $0 --list-installed ${want}" >&2
+    return 1
+  fi
+  if (( ${#matches[@]} > 1 )); then
+    echo "\"$want\" is ambiguous — qualify it with the manager:" >&2
+    local m rest
+    for m in "${matches[@]}"; do rest="${m#*|}"; echo "  ${rest%%|*}" >&2; done
+    return 2
+  fi
+
+  IFS='|' read -r b h src <<< "${matches[0]}"
+  mgr="${h%%:*}"; name="${h#*:}"
+  step "Uninstall $h  ($(human "$b"))"
+
+  # A directory is the entire installation, so removal goes through drop() like
+  # everything else the script deletes — same dry run, same accounting.
+  case "$mgr" in
+    agent) path="$HOME/.local/share/zed/external_agents/registry/$name" ;;
+    go)    path="$HOME/go/bin/$name" ;;
+    nvm)   path="$HOME/.nvm/versions/node/$name" ;;
+    *)     path="" ;;
+  esac
+  if [[ -n "$path" ]]; then
+    drop "$path"
+    [[ "$FORCE" -eq 1 ]] && note "removed" || note "re-run with --force to apply"
+    return 0
+  fi
+
+  local -a cmd=()
+  case "$mgr" in
+    apt)
+      local ess prio
+      IFS=$'\t' read -r ess prio < <(dpkg-query -Wf '${Essential}\t${Priority}\n' "$name" 2>/dev/null)
+      # apt will take half the system with a required package if asked, and the
+      # answer to "are you sure" is no. This is a disk-space tool.
+      if [[ "$ess" == yes || "$prio" == required || "$prio" == important ]]; then
+        echo "refusing: $name is Essential=$ess, Priority=$prio — the system is built out of it" >&2
+        return 1
+      fi
+      cmd=(apt-get purge -y "$name")
+      [[ "$EUID" -eq 0 ]] || cmd=(sudo "${cmd[@]}")
+      if [[ "$FORCE" -eq 0 ]]; then
+        # -s needs no root and is the only honest preview: the cascade matters
+        # far more than the one package that was asked for.
+        note "apt would take these with it:"
+        apt-get -s purge "$name" 2>/dev/null | grep -E '^(Remv|Purg)' | sed 's/^/     /' \
+          || note "     (only $name)"
+      fi ;;
+    npm)
+      # `npm -g` resolves against whichever node is first on PATH — Zed's here,
+      # not the one that owns /usr/local. Point it at the root the package was
+      # actually found in.
+      cmd=(npm uninstall -g --prefix "${src%/lib/node_modules}" "$name")
+      [[ -w "$src" ]] || cmd=(sudo "${cmd[@]}") ;;
+    cargo) cmd=(cargo uninstall "$name") ;;
+    sdk)   cmd=("${ANDROID_HOME:-$HOME/Android/Sdk}/cmdline-tools/latest/bin/sdkmanager" --uninstall "$name") ;;
+    *)     echo "no removal path for manager: $mgr" >&2; return 1 ;;
+  esac
+
+  if [[ "$FORCE" -eq 0 ]]; then
+    note "[dry] ${cmd[*]}"
+    note "would return about $(human "$b") — re-run with --force to apply"
+    return 0
+  fi
+  note "${cmd[*]}"
+  if "${cmd[@]}"; then
+    printf '   removed %s, about %s%s%s returned\n' "$h" "$c_ylw" "$(human "$b")" "$c_rst"
+  else
+    echo "uninstall failed: ${cmd[*]}" >&2
+    return 1
+  fi
+}
+
 # ── preflight ────────────────────────────────────────────────────────────────
 if [[ "$FORCE" -eq 0 ]]; then
   printf '%sDRY RUN%s — nothing will be deleted. Re-run with --force to apply.\n' "$c_ylw" "$c_rst"
@@ -553,6 +827,18 @@ fi
 if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
   note "running under sudo — cleaning ${RUN_USER}'s home ($HOME); --system needs no second password"
 fi
+# These two are modes rather than steps: they answer about installed programs
+# instead of derived data, and they exit rather than fall through into a cleanup
+# nobody asked for. Neither needs DEV_DIR to exist.
+if (( LIST_INSTALLED )); then
+  cmd_list_installed "$LIST_FILTER"
+  exit 0
+fi
+if [[ -n "$UNINSTALL" ]]; then
+  cmd_uninstall "$UNINSTALL"
+  exit $?
+fi
+
 [[ -d "$DEV_DIR" ]] || {
   echo "no such directory: $DEV_DIR" >&2
   echo "point it somewhere real:  DEV_DIR=/path/to/repos $0 $*" >&2
