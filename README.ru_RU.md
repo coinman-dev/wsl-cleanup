@@ -147,7 +147,7 @@ sudo ./wsl-cleanup.sh --force --all
 
 После удаления файлов внутри WSL2 освободившееся место остаётся занятым внутри контейнера виртуального диска. Чтобы сжать сам файл `.vhdx` на хосте Windows:
 
-`wsl-cleanup.sh` печатает точный найденный путь в конце прогона.
+`wsl-cleanup.sh` печатает точный найденный путь в конце прогона — уже без префикса расширенного пути `\\?\`, с которым WSL хранит его в реестре: PowerShell трактует такой префикс как UNC-путь к хосту с именем `?`, и `Optimize-VHD` вместе с `diskpart` его отвергают.
 
 ### Вариант A: PowerShell (Windows Pro / Enterprise с Hyper-V)
 
@@ -155,7 +155,7 @@ sudo ./wsl-cleanup.sh --force --all
 
 ```powershell
 wsl --shutdown
-Optimize-VHD -Path "<путь-из-вывода-скрипта>\ext4.vhdx" -Mode Full
+Optimize-VHD -Path "<путь-из-вывода-скрипта>" -Mode Full
 ```
 
 ### Вариант B: Diskpart (Windows Home / Standard)
@@ -170,7 +170,7 @@ diskpart
 Внутри `diskpart`:
 
 ```text
-select vdisk file="<путь-из-вывода-скрипта>\ext4.vhdx"
+select vdisk file="<путь-из-вывода-скрипта>"
 attach vdisk readonly
 compact vdisk
 detach vdisk

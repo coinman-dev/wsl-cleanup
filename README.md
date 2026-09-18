@@ -164,7 +164,7 @@ Three deliberate limits:
 
 After cleaning up files inside WSL2, the freed disk space remains allocated inside the virtual hard disk container. To shrink the physical `.vhdx` file on your Windows host:
 
-`wsl-cleanup.sh` prints your exact detected path at the end of the run:
+`wsl-cleanup.sh` prints your exact detected path at the end of the run, already stripped of the `\\?\` extended-length prefix that WSL stores in the registry — PowerShell reads that prefix as a UNC host named `?`, and both `Optimize-VHD` and `diskpart` reject it.
 
 ### Option A: PowerShell (Windows Pro / Enterprise with Hyper-V)
 
@@ -172,7 +172,7 @@ Run in an **Administrator PowerShell**:
 
 ```powershell
 wsl --shutdown
-Optimize-VHD -Path "<Path-Reported-By-Script>\ext4.vhdx" -Mode Full
+Optimize-VHD -Path "<Path-Reported-By-Script>" -Mode Full
 ```
 
 ### Option B: Diskpart (Windows Home / Standard)
@@ -187,7 +187,7 @@ diskpart
 Inside `diskpart`:
 
 ```text
-select vdisk file="<Path-Reported-By-Script>\ext4.vhdx"
+select vdisk file="<Path-Reported-By-Script>"
 attach vdisk readonly
 compact vdisk
 detach vdisk

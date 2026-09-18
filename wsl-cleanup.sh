@@ -433,10 +433,16 @@ detect_vhdx_path() {
   if [[ -f /mnt/c/Windows/System32/reg.exe ]]; then
     local reg_out base_path vhd_name
     reg_out="$(/mnt/c/Windows/System32/reg.exe query "HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss" /s 2>/dev/null | tr -d '\r')"
-    base_path="$(echo "$reg_out" | awk '/BasePath/ {print $3}' | head -1)"
-    vhd_name="$(echo "$reg_out" | awk '/VhdFileName/ {print $3}' | head -1)"
+    # Take the whole value, not the third whitespace-separated field: a BasePath
+    # like C:\Users\me\My Distros\alpine would otherwise come back truncated.
+    base_path="$(echo "$reg_out" | sed -n 's/^[[:space:]]*BasePath[[:space:]]\+REG_SZ[[:space:]]\+//p' | head -1)"
+    vhd_name="$(echo "$reg_out" | sed -n 's/^[[:space:]]*VhdFileName[[:space:]]\+REG_SZ[[:space:]]\+//p' | head -1)"
     [[ -z "$vhd_name" ]] && vhd_name="ext4.vhdx"
     if [[ -n "$base_path" ]]; then
+      # WSL records BasePath with the Win32 extended-length prefix (\\?\D:\...).
+      # PowerShell resolves that as a UNC path to a host named "?", so both
+      # Optimize-VHD and diskpart reject it. Hand out a plain drive path.
+      base_path="${base_path#\\\\\?\\}"
       base_path="${base_path%\\}"
       vhdx_path="${base_path}\\${vhd_name}"
     fi
