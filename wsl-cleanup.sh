@@ -4,6 +4,11 @@
 # data: tool caches, build output, and superseded copies of things that keep
 # several versions of themselves side by side.
 #
+# Runs just as well on a native Ubuntu/Debian desktop. It tells the two apart
+# by itself: the .vhdx advice at the end is printed only under WSL, and a real
+# install gets browser caches, thumbnails, crash dumps, snap and flatpak
+# leftovers instead, plus a warning when btrfs snapshots will keep the space.
+#
 # Sibling of the two scripts in ownlocator/scripts: clean-artifacts.sh strips
 # build output from ONE repo, server-cleanup.sh maintains the PRODUCTION host.
 # This one is for the development machine as a whole — every repo under
@@ -65,12 +70,17 @@
 # Opt-in, because each of these costs a re-download rather than a rebuild
 # (--all turns them all on except --purge-pgtest, which is data, not cache):
 #   --deep              Go module cache, npm/cargo package caches, npx cache,
-#                       Playwright browser caches, Gradle transforms, and
-#                       node_modules dirs in ~/Development
+#                       Playwright browser caches, Gradle transforms,
+#                       node_modules dirs in ~/Development, and the HTTP
+#                       caches of Firefox and Chromium-family browsers
+#                       (skipped while that browser is running)
 #   --system            apt cache + package lists + orphaned packages, the
 #                       systemd journal, rotated logs under /var/log,
 #                       incompatible global npm architecture binaries, and
-#                       ROOT'S OWN HOME caches. Needs sudo.
+#                       ROOT'S OWN HOME caches. Needs sudo. Wherever they
+#                       exist (a desktop, mostly), also crash reports, core
+#                       dumps, disabled snap revisions and unused flatpak
+#                       runtimes.
 #   --purge-bak         *.bak copies in /opt/ownlocator and stale backups
 #                       in /var/lib/ownlocator/media-wsl-backup
 #   --purge-pgtest      ~/.local/pgtest, the local Postgres test cluster
@@ -82,6 +92,9 @@
 #
 # WSL note: freeing space inside the VM does NOT shrink the .vhdx on Windows.
 # The script automatically detects the host .vhdx path and prints instructions.
+#
+# btrfs note: a file that a snapshot still references frees nothing when it is
+# deleted. On btrfs the script counts the snapshots (as root) and says so.
 #
 set -euo pipefail
 
@@ -97,6 +110,12 @@ if [[ "${EUID}" -eq 0 && -n "${SUDO_USER:-}" ]]; then
   export HOME
 else
   RUN_USER="$(id -un)"
+fi
+
+# WSL2 or a real install. Steps that only make sense on one of them ask this.
+IS_WSL=0
+if [[ -n "${WSL_DISTRO_NAME:-}" ]] || grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
+  IS_WSL=1
 fi
 
 DEV_DIR="${DEV_DIR:-$HOME/Development}"
@@ -182,6 +201,17 @@ drop() {
   fi
 }
 
+# drop() for paths only root can read or measure: --system's share. Same line,
+# same accounting, same dry run; $SUDO is set by the --system step.
+sys_drop() {
+  local p="$1" b
+  ${SUDO:-} test -e "$p" || return 0
+  b="$(${SUDO:-} du -sB1 "$p" 2>/dev/null | cut -f1)"
+  TOTAL=$(( TOTAL + ${b:-0} ))
+  (( DROP_QUIET )) || printf '   %s%8s%s  %s\n' "$c_ylw" "$(human "${b:-0}")" "$c_rst" "$p"
+  if [[ "$FORCE" -eq 1 ]]; then ${SUDO:-} rm -rf -- "$p" || true; fi
+}
+
 # Children of $1 sorted by embedded version number, newest last. Used where the
 # directory name carries a real version (go1.26.5, v22.22.1, 35.0.0).
 by_version() { ls -1 "$1" 2>/dev/null | sort -V; }
@@ -189,8 +219,9 @@ by_version() { ls -1 "$1" 2>/dev/null | sort -V; }
 # Children of $1 sorted by mtime, newest last. Used where the name is a commit
 # hash or an opaque build id and only "when did it arrive" can order them.
 # Matches files as well as directories: ~/.zed_server keeps each release as a
-# bare binary, not a folder.
-by_mtime() { ls -1dt "$1"/* 2>/dev/null | sed 's:/*$::' | tac; }
+# bare binary, not a folder. An optional glob narrows it to the entries that
+# really are versions, for directories that keep something else beside them.
+by_mtime() { ls -1dt "$1"/${2:-*} 2>/dev/null | sed 's:/*$::' | tac; }
 
 # Is anything running out of this directory right now? Never delete the tools
 # holding the session that is doing the deleting.
@@ -376,9 +407,9 @@ prune_foreign_platform_binaries() {
 # entries are versions of one program under opaque names — commit hashes, build
 # ids — where only arrival order can rank them.
 prune_keep_newest() {
-  local d="$1" old
+  local d="$1" glob="${2:-*}" old
   [[ -d "$d" ]] || return 0
-  mapfile -t vers < <(by_mtime "$d")
+  mapfile -t vers < <(by_mtime "$d" "$glob")
   (( ${#vers[@]} > 0 )) || return 0
   keep "${vers[-1]}"
   for old in "${vers[@]:0:${#vers[@]}-1}"; do
@@ -459,6 +490,58 @@ detect_vhdx_path() {
   echo "$vhdx_path"
 }
 
+# Is one of these browsers open for this user? A profile's cache is an index
+# plus entries, and pulling it out from under a running browser earns a
+# corrupt-cache rebuild at best. pgrep -x matches the process name, which is
+# what each of them is called whether it came from a .deb, a snap or a tarball.
+browser_running() {
+  local who="$1"; shift
+  local n
+  for n in "$@"; do pgrep -u "$who" -x "$n" >/dev/null 2>&1 && return 0; done
+  return 1
+}
+
+# Firefox and the Chromium family keep their HTTP cache under ~/.cache, apart
+# from the profile — bookmarks, passwords, cookies and sessions live in
+# ~/.mozilla and ~/.config and are not looked at. What is here comes back from
+# the network on the next visit, which is why it waits for --deep.
+clean_browser_caches() {
+  local h="$1" who="$2"
+  step "Browser HTTP caches ($who, --deep) — profiles themselves are never touched"
+  local found=0 c
+
+  local -a ff=()
+  mapfile -t ff < <(ls -1d "$h"/.cache/mozilla/firefox/*/cache2 \
+                            "$h"/snap/firefox/common/.cache/mozilla/firefox/*/cache2 2>/dev/null)
+  if (( ${#ff[@]} )); then
+    found=1
+    if browser_running "$who" firefox firefox-bin; then
+      note "Firefox is running — close it to clear its cache, skipping"
+    else
+      for c in "${ff[@]}"; do drop "$c"; done
+    fi
+  fi
+
+  # name under ~/.cache | process names
+  local entry dir procs sub
+  for entry in "google-chrome|chrome" "chromium|chromium chromium-browser" \
+               "BraveSoftware/Brave-Browser|brave" "microsoft-edge|msedge" \
+               "vivaldi|vivaldi-bin"; do
+    dir="$h/.cache/${entry%%|*}"; procs="${entry#*|}"
+    [[ -d "$dir" ]] || continue
+    found=1
+    # shellcheck disable=SC2086  # the process list is meant to split
+    if browser_running "$who" $procs; then
+      note "${entry%%|*} is running — close it to clear its cache, skipping"
+      continue
+    fi
+    for sub in "$dir"/*/Cache "$dir"/*/"Code Cache" "$dir"/*/GPUCache; do
+      [[ -d "$sub" ]] && drop "$sub"
+    done
+  done
+  (( found )) || note "none"
+}
+
 # Everything that a home directory accumulates regardless of whose home it is.
 # Called for you, and again for /root under --system.
 clean_home_caches() {
@@ -466,8 +549,9 @@ clean_home_caches() {
 
   # Zed ships its own Node and points npm's cache at it.
   step "Zed npm cache ($who)"
+  # Newer Zed keeps it beside the runtimes rather than inside one.
   local found=0 c
-  for c in "$h"/.local/share/zed/node/*/cache; do
+  for c in "$h"/.local/share/zed/node/cache "$h"/.local/share/zed/node/*/cache; do
     [[ -d "$c" ]] || continue
     drop "$c"; found=1
   done
@@ -489,9 +573,13 @@ clean_home_caches() {
 
   step "Editor servers and Node runtimes ($who) — keep the newest of each"
   local d
-  for d in "$h/.cursor-server/bin" "$h/.zed_server" "$h/.local/share/zed/node"; do
+  for d in "$h/.cursor-server/bin" "$h/.zed_server"; do
     prune_keep_newest "$d"
   done
+  # Only the node-v* entries are runtimes. The npm cache sits beside them, is
+  # touched on every install and so is always the newest — ranked with them it
+  # was "kept" while the one runtime Zed actually uses was dropped.
+  prune_keep_newest "$h/.local/share/zed/node" 'node-v*'
 
   step "Cursor Server extensions ($who) — keep the newest release of each"
   prune_cursor_extensions "$h/.cursor-server/extensions"
@@ -542,13 +630,19 @@ clean_home_caches() {
   prune_foreign_platform_binaries "$who" \
     "$h/.local/share/zed/external_agents" "$h/.local/share/zed/node"
 
+  step "Launchpad API and thumbnail caches ($who)"
   # launchpadlib caches Launchpad's API responses for add-apt-repository. Only
   # the cache subtree: the library also files OAuth credentials in this
   # directory on machines that have logged in.
   drop "$h/.launchpadlib/api.launchpad.net/cache"
 
+  # File-manager thumbnails (Dolphin, Nautilus, every freedesktop viewer):
+  # regenerated from the files themselves the next time a folder is opened.
+  drop "$h/.cache/thumbnails"
+
   # Package caches and heavy dependencies. Waiting for --deep because they re-download.
   [[ "$DEEP" -eq 1 ]] || return 0
+  clean_browser_caches "$h" "$who"
   step "Package caches ($who, --deep)"
   local m tr
   local sub
@@ -955,8 +1049,22 @@ mapfile -t JUNK < <(
        -o -name '*.swp' -o -name '*.swo' -o -name '*.orig' -o -name '*.rej' \) \
     -not -path '*/.git/*' 2>/dev/null | head -500
 )
+# A name is not proof of junk. `cargo vendor` ships every crate's
+# Cargo.toml.orig, its .cargo-checksum.json lists it, and a repo that commits
+# vendor/ commits it too — dropping it is editing that repo's source. Whatever
+# git tracks is somebody's file, whatever the extension says.
+tracked_by_git() {
+  # An untracked vendor/ still has its checksum file, and cargo refuses the
+  # whole crate when a file it lists has gone.
+  [[ -f "$(dirname "$1")/.cargo-checksum.json" ]] && return 0
+  git -C "$(dirname "$1")" ls-files --error-unmatch -- "$(basename "$1")" >/dev/null 2>&1
+}
 if (( ${#JUNK[@]} == 0 )); then note "none"; else
-  for f in "${JUNK[@]}"; do drop "$f"; done
+  JUNK_TRACKED=0
+  for f in "${JUNK[@]}"; do
+    if tracked_by_git "$f"; then JUNK_TRACKED=$(( JUNK_TRACKED + 1 )); else drop "$f"; fi
+  done
+  (( JUNK_TRACKED == 0 )) || note "$JUNK_TRACKED matching file(s) tracked by git or listed by a vendored crate — source, kept"
 fi
 drop "$HOME/.local/share/Trash"
 
@@ -1011,30 +1119,78 @@ if [[ "$SYSTEM" -eq 1 ]]; then
   if [[ -n "$SUDO" ]] && ! sudo -n true 2>/dev/null && [[ ! -t 0 ]]; then
     note "needs sudo and there is no terminal to ask on — skipping"
   else
-    note "apt cache: $(du -sh /var/cache/apt/archives 2>/dev/null | cut -f1)"
+    # Counted, not just shown: apt-get clean empties it whole.
+    APT_CACHE_B="$($SUDO du -sB1 /var/cache/apt/archives 2>/dev/null | cut -f1 || true)"
+    TOTAL=$(( TOTAL + ${APT_CACHE_B:-0} ))
+    printf '   %s%8s%s  %s\n' "$c_ylw" "$(human "${APT_CACHE_B:-0}")" "$c_rst" "/var/cache/apt/archives"
     if [[ "$FORCE" -eq 1 ]]; then
       $SUDO apt-get clean
       DEBIAN_FRONTEND=noninteractive $SUDO apt-get autoremove --purge -y
       # journalctl reports what it freed on stderr in its own format; measuring
       # the directory is both simpler and in the same units as everything else.
-      JOURNAL_B0="$($SUDO du -sB1 /var/log/journal 2>/dev/null | cut -f1)"
+      JOURNAL_B0="$($SUDO du -sB1 /var/log/journal 2>/dev/null | cut -f1 || true)"
       $SUDO journalctl --vacuum-size="$JOURNAL_KEEP"
-      JOURNAL_B1="$($SUDO du -sB1 /var/log/journal 2>/dev/null | cut -f1)"
+      JOURNAL_B1="$($SUDO du -sB1 /var/log/journal 2>/dev/null | cut -f1 || true)"
       TOTAL=$(( TOTAL + ${JOURNAL_B0:-0} - ${JOURNAL_B1:-0} ))
     else
       note "[dry] apt-get clean"
-      $SUDO apt-get -s autoremove --purge 2>/dev/null | grep -E '^Remv' | sed 's/^/   [dry] /' \
+      $SUDO apt-get -s autoremove --purge 2>/dev/null | grep -E '^(Remv|Purg)' | sed 's/^/   [dry] /' \
         || note "nothing to autoremove"
       note "[dry] journalctl --vacuum-size=$JOURNAL_KEEP  (now: $(journalctl --disk-usage 2>/dev/null | sed 's/^.*take up //'))"
     fi
-    # Rotated copies only — the live file per service stays.
-    mapfile -t OLD_LOGS < <($SUDO find /var/log -regextype posix-extended -type f \
-      \( -name '*.gz' -o -name '*.old' -o -regex '.*\\.[0-9]+' -o -regex '.*-[0-9]{8}' \) 2>/dev/null)
+    # Rotated copies only — the live file per service stays. installer/ is the
+    # record of how this system was installed, not a log anybody rotates, and
+    # a name ending in an address is samba's live per-client log, not log.1.
+    mapfile -t OLD_LOGS < <($SUDO find /var/log -regextype posix-extended \
+      -path /var/log/installer -prune -o -type f \
+      \( -name '*.gz' -o -name '*.old' -o -regex '.*\.[0-9]+' -o -regex '.*-[0-9]{8}' \) \
+      -not -regex '.*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' -print 2>/dev/null)
     if (( ${#OLD_LOGS[@]} == 0 )); then note "no rotated logs"; else
-      for f in "${OLD_LOGS[@]}"; do
-        printf '   %s%8s%s  %s\n' "$c_ylw" "$(human "$($SUDO du -sB1 "$f" 2>/dev/null | cut -f1)")" "$c_rst" "$f"
-        [[ "$FORCE" -eq 1 ]] && $SUDO rm -f -- "$f"
-      done
+      for f in "${OLD_LOGS[@]}"; do sys_drop "$f"; done
+    fi
+
+    # What crashed: apport's reports and systemd-coredump's cores. Both exist
+    # to be sent or inspected once; a desktop that ran LibreOffice for a month
+    # has collected a few hundred megabytes of them.
+    mapfile -t CRASHES < <($SUDO find /var/crash /var/lib/systemd/coredump \
+      -mindepth 1 -maxdepth 1 -type f 2>/dev/null | sort)
+    if (( ${#CRASHES[@]} == 0 )); then note "no crash reports or core dumps"; else
+      for f in "${CRASHES[@]}"; do sys_drop "$f"; done
+    fi
+
+    # snapd keeps the previous revision of every snap for `snap revert`. The
+    # disabled ones are exactly those, and `snap remove --revision` is the only
+    # way out that keeps snapd's own bookkeeping straight.
+    if command -v snap >/dev/null 2>&1; then
+      mapfile -t SNAP_OLD < <(LANG=C snap list --all 2>/dev/null | awk '$NF ~ /disabled/ {print $1" "$3}')
+      if (( ${#SNAP_OLD[@]} == 0 )); then note "snap: no disabled revisions"; else
+        for s in "${SNAP_OLD[@]}"; do
+          sn="${s% *}"; sr="${s#* }"
+          b="$(size_of "/var/lib/snapd/snaps/${sn}_${sr}.snap")"
+          TOTAL=$(( TOTAL + ${b:-0} ))
+          printf '   %s%8s%s  snap %s, revision %s (disabled)\n' "$c_ylw" "$(human "${b:-0}")" "$c_rst" "$sn" "$sr"
+          [[ "$FORCE" -eq 1 ]] && { $SUDO snap remove "$sn" --revision="$sr" || true; }
+        done
+      fi
+    fi
+
+    # Runtimes no installed app depends on any more, system-wide and in the
+    # user's own installation. flatpak has no dry run; it is measured instead.
+    if command -v flatpak >/dev/null 2>&1; then
+      FP_DIRS=(/var/lib/flatpak "$HOME/.local/share/flatpak")
+      FP_B0="$($SUDO du -scB1 "${FP_DIRS[@]}" 2>/dev/null | tail -1 | cut -f1 || true)"
+      if [[ "$FORCE" -eq 1 ]]; then
+        $SUDO flatpak uninstall --system --unused -y --noninteractive || true
+        if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+          sudo -u "$RUN_USER" flatpak uninstall --user --unused -y --noninteractive || true
+        else
+          flatpak uninstall --user --unused -y --noninteractive || true
+        fi
+        FP_B1="$($SUDO du -scB1 "${FP_DIRS[@]}" 2>/dev/null | tail -1 | cut -f1 || true)"
+        TOTAL=$(( TOTAL + ${FP_B0:-0} - ${FP_B1:-0} ))
+      else
+        note "[dry] flatpak uninstall --unused  (system + user; flatpak now: $(human "${FP_B0:-0}"))"
+      fi
     fi
 
     # The downloaded package index
@@ -1042,7 +1198,7 @@ if [[ "$SYSTEM" -eq 1 ]]; then
     # directory. That means the running total has to be fed here by hand too, or
     # the summary under-reports the run by however big the index is.
     if [[ -d /var/lib/apt/lists ]]; then
-      APT_LISTS_B="$($SUDO du -sB1 /var/lib/apt/lists 2>/dev/null | cut -f1)"
+      APT_LISTS_B="$($SUDO du -sB1 /var/lib/apt/lists 2>/dev/null | cut -f1 || true)"
       TOTAL=$(( TOTAL + ${APT_LISTS_B:-0} ))
       printf '   %s%8s%s  %s\n' "$c_ylw" "$(human "${APT_LISTS_B:-0}")" "$c_rst" \
         "/var/lib/apt/lists"
@@ -1106,7 +1262,25 @@ for entry in "${CACHE_STATE[@]}"; do
   path="${entry%%|*}"
   note "  ${path/#$HOME/\~}: ${entry#*|}"
 done
-if [[ "$(uname -r)" == *microsoft-standard-WSL2* ]]; then
+if (( ! IS_WSL )); then
+  # A real kernel boots here, so apt keeps the previous one as a fallback and
+  # autoremove (--system) only takes those older still. Listed, not removed:
+  # which kernel is safe to lose is something only a reboot proves.
+  mapfile -t OTHER_KERNELS < <(dpkg-query -Wf '${db:Status-Abbrev}${Package}\n' 'linux-image-[0-9]*' 2>/dev/null \
+                                 | sed -n 's/^ii *//p' | grep -vF -- "$(uname -r)" || true)
+  if (( ${#OTHER_KERNELS[@]} > 0 )); then
+    # The image alone is not the kernel: its modules (and the nvidia build
+    # against them) are separate packages that purging the image leaves behind.
+    KPKGS=()
+    for k in "${OTHER_KERNELS[@]}"; do
+      mapfile -t -O "${#KPKGS[@]}" KPKGS < <(dpkg-query -Wf '${db:Status-Abbrev}${Package}\n' \
+        "linux-*-${k#linux-image-}" 2>/dev/null | sed -n 's/^ii *//p')
+    done
+    note "kernels besides the running $(uname -r), kept as boot fallbacks: ${OTHER_KERNELS[*]#linux-image-}"
+    note "  once the running one has proved itself: sudo apt-get purge ${KPKGS[*]}"
+  fi
+fi
+if (( IS_WSL )); then
   mapfile -t HDRS < <(dpkg-query -Wf '${Package}\n' 'linux-headers-*' 2>/dev/null | sed '/^$/d')
   if (( ${#HDRS[@]} > 0 )); then
     HDR_KB="$(dpkg-query -Wf '${Installed-Size}\n' 'linux-headers-*' 2>/dev/null | awk '{s+=$1} END {print s+0}')"
@@ -1138,6 +1312,30 @@ else
     "$c_ylw" "$(human "$TOTAL")" "$c_rst"
   [[ "$DEEP"   -eq 1 ]] || note "add --deep for package caches, npx, playwright and gradle transforms"
   [[ "$SYSTEM" -eq 1 ]] || note "add --system for apt and the journal"
+fi
+
+# On a real disk there is nothing to compact — but on btrfs a deleted file
+# whose extents a snapshot still holds frees nothing at all, and df will show
+# it. Say so rather than leave "Reclaimed: 0B" unexplained.
+if (( ! IS_WSL )); then
+  if [[ "$(findmnt -no FSTYPE --target "$HOME" 2>/dev/null)" == btrfs ]]; then
+    BTRFS=(btrfs); [[ "$EUID" -eq 0 ]] || BTRFS=(sudo -n btrfs)
+    # A listing that failed is not a listing that came back empty.
+    if SNAPLIST="$("${BTRFS[@]}" subvolume list -s "$HOME" 2>/dev/null)"; then
+      SNAPS="$(grep -c . <<< "$SNAPLIST" || true)"
+      if (( SNAPS > 0 )); then
+        note "btrfs: $SNAPS snapshot(s) on this filesystem — what they still reference stays"
+        note "  allocated until they go (snapper / timeshift / btrfs subvolume delete)."
+      else
+        note "btrfs: no snapshots, so what was freed is really free."
+      fi
+    else
+      note "btrfs: snapshots keep deleted data allocated; counting them needs root (or btrfs-progs):"
+      note "  sudo btrfs subvolume list -s /"
+    fi
+    note "  df is an estimate on btrfs — the exact picture: sudo btrfs filesystem usage /"
+  fi
+  exit 0
 fi
 
 VHDX_PATH="$(detect_vhdx_path)"

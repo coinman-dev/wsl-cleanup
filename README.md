@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/Platform-WSL2%20%7C%20Ubuntu-orange.svg)](https://learn.microsoft.com/en-us/windows/wsl/)
 [![Shell](https://img.shields.io/badge/Shell-Bash-green.svg)](https://www.gnu.org/software/bash/)
 
-A safe, idempotent, and version-aware disk reclaim utility designed specifically for WSL2 (Windows Subsystem for Linux) development environments.
+A safe, idempotent, and version-aware disk reclaim utility designed specifically for WSL2 (Windows Subsystem for Linux) development environments — and equally at home on a native Ubuntu/Debian desktop.
 
 ---
 
@@ -160,6 +160,19 @@ Three deliberate limits:
 
 ---
 
+## Native Linux (no WSL)
+
+The same script runs on a real Ubuntu/Debian install and tells the two apart by itself (`WSL_DISTRO_NAME` or `microsoft`/`wsl` in the kernel release). Everything above applies unchanged; on top of it:
+
+- **No `.vhdx` advice.** There is no virtual disk to compact, so the WSL instructions at the end are not printed.
+- **Thumbnails** (`~/.cache/thumbnails`) go in the default run — Dolphin, Nautilus and every other viewer regenerate them from the files.
+- **Browser HTTP caches** go under `--deep`: Firefox (`~/.cache/mozilla/firefox/*/cache2`, the snap one too) and the Chromium family — Chrome, Chromium, Brave, Edge, Vivaldi (`Cache`, `Code Cache`, `GPUCache`). A browser that is running is skipped. Profiles — bookmarks, passwords, cookies, sessions — live elsewhere and are never touched.
+- **`--system` also takes** apport crash reports (`/var/crash`), systemd core dumps (`/var/lib/systemd/coredump`), disabled snap revisions (via `snap remove --revision`), and flatpak runtimes no app uses any more (`flatpak uninstall --unused`, system and user). Each step is skipped when that tool is not installed.
+- **Old kernels are reported, not removed.** apt keeps the previous kernel as a boot fallback on purpose; the script lists it with the full set of packages (`image`, `modules`, `headers`, …) to purge once the running one has proved itself.
+- **btrfs.** A deleted file that a snapshot still references frees nothing. On btrfs the script counts the snapshots (needs root) and reminds you that `df` is only an estimate there — `sudo btrfs filesystem usage /` gives the real figure.
+
+---
+
 ## Compacting the Virtual Disk (`.vhdx`) on Windows
 
 After cleaning up files inside WSL2, the freed disk space remains allocated inside the virtual hard disk container. To shrink the physical `.vhdx` file on your Windows host:
@@ -224,7 +237,9 @@ DEV_DIR=/path/to/my/projects ./wsl-cleanup.sh --force
 | **Other-platform binaries** | Packages tagged for an OS or architecture this machine cannot execute — `win32-*`, `darwin-*`, `*-arm64` — wherever npm or prebuildify installed them | Anything untagged, and a musl build with no glibc sibling (Codex ships **only** a static musl binary, which runs fine on glibc) |
 | **Rust / Cargo** | Redownloadable registry index/cache (under `--deep`), `target/` build output | Offline documentation (`rust-docs`), active toolchains |
 | **Android / Gradle** | Superseded build-tools, build cache, transforms (under `--deep`) | Active build-tools, wrapper distribution, keystores |
-| **Repositories** | Build artifacts (`target/`, `build/`, `dist/`, `.gradle/`, `reports/`) | All source code, Git history, documentation, `.env` configs |
+| **Repositories** | Build artifacts (`target/`, `build/`, `dist/`, `.gradle/`, `reports/`), stray `*.orig` / `*.rej` / `*.swp` | All source code, Git history, documentation, `.env` configs — and any "junk-looking" file git tracks or a vendored crate's checksum lists |
+| **Desktop (native)** | Thumbnails; browser HTTP caches (under `--deep`, browser closed) | Browser profiles: bookmarks, passwords, cookies, sessions |
+| **System (`--system`)** | APT cache and lists, orphaned packages, journal over `JOURNAL_KEEP`, rotated logs, crash reports, core dumps, disabled snap revisions, unused flatpak runtimes | Live logs, `/var/log/installer`, samba's per-client logs, the fallback kernel |
 
 ---
 
