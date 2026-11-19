@@ -20,6 +20,7 @@
 #   */secrets/**                        release keystores and build config
 #   ~/ownlocator-backups                your backups
 #   ~/.claude ~/.codex ~/.gemini        ALL AI AGENT SESSIONS, MEMORY, TRANSCRIPTS
+#   ~/.kimi-code ($KIMI_CODE_HOME)       Kimi Code sessions, dialogs, history, memory
 #   ~/.copilot                           GitHub Copilot sessions, context, memory, logs
 #                                        (~/.cache/copilot is NOT this: see below)
 #   ~/.local/share/opencode              OpenCode memory and state
@@ -1083,6 +1084,7 @@ note "ALL agent sessions, history and persistent memory are strictly preserved:"
 note "  ~/.claude (projects, sessions, tasks, memory)"
 note "  ~/.codex (sessions, memories, archived_sessions, rules, logs_2.sqlite)"
 note "  ~/.gemini (conversations, brain, cli)"
+note "  ~/.kimi-code or \$KIMI_CODE_HOME (sessions, dialogs, input history, configuration)"
 note "  ~/.copilot (sessions, transcripts, context, memory, logs, configuration)"
 note "  ~/.local/share/opencode"
 note "~/.cache/copilot is not in this list: it holds no session or memory data, only"

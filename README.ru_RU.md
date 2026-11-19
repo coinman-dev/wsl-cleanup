@@ -35,6 +35,7 @@
     - Claude (`~/.claude/projects`, `~/.claude/sessions`, `~/.claude/tasks`)
     - Codex (`~/.codex/sessions`, `~/.codex/memories`, `~/.codex/rules`, `~/.codex/logs_2.sqlite`)
     - Gemini / Antigravity (`~/.gemini/antigravity-acp/conversations`, `~/.gemini/antigravity-acp/brain`, сессии CLI)
+    - Kimi Code (`~/.kimi-code` или `$KIMI_CODE_HOME`: сессии, индекс диалогов, история ввода, конфигурация)
     - OpenCode (`~/.local/share/opencode`)
     - GitHub Copilot CLI (`~/.copilot`: сессии, транскрипты, контекст, память, логи и конфигурация)
   - Удаляются только временные сборочные и плагинные кэши (`.tmp`, кэши плагинов), где никакой истории разговоров нет.
@@ -213,7 +214,7 @@ DEV_DIR=/path/to/my/projects ./wsl-cleanup.sh --force
 
 | Категория | Чистится / освобождается | Сохраняется / защищено |
 | :--- | :--- | :--- |
-| **ИИ-агенты** | Временные файлы (`.tmp`, кэш плагинов), самораспакованная нагрузка Copilot CLI (`~/.cache/copilot`, ~140 МБ, восстанавливается офлайн за ~2 с) | **Все** сессии, история переписки, память, правила, задачи (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.copilot`, `~/.local/share/opencode`) |
+| **ИИ-агенты** | Временные файлы (`.tmp`, кэш плагинов), самораспакованная нагрузка Copilot CLI (`~/.cache/copilot`, ~140 МБ, восстанавливается офлайн за ~2 с) | **Все** сессии, история переписки, память, правила, задачи (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.kimi-code` или `$KIMI_CODE_HOME`, `~/.copilot`, `~/.local/share/opencode`) |
 | **Cursor и редакторы** | Старые версии расширений, кэшированные архивы VSIX, вытесненные серверные бинарники | Последние версии расширений, активные серверные бинарники, настройки |
 | **Go** | Старые версии тулчейнов (`toolchain@...`) и кэш модулей `golang.org/x` под `--deep` | **Новейший** тулчейн Go |
 | **Node / NPM** | `~/.npm/_npx`, `_cacache` | Активная версия NVM, версии, закреплённые в `.nvmrc` |
